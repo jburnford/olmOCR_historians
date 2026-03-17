@@ -2,31 +2,24 @@
 Full-PDF olmOCR predictor for Replicate.
 
 Processes an entire PDF document through olmOCR and returns a single
-markdown file. Uses transformers for inference, processing pages sequentially.
+markdown file. Runs vLLM as a subprocess server for batched inference.
 """
 
-import base64
+import concurrent.futures
 import json
 import os
 import subprocess
 import tempfile
 import time
-from io import BytesIO
+import urllib.request
+import urllib.error
 from pathlib import Path as PathLib
 
 from cog import BasePredictor, Input, Path
 
-MODEL_CACHE = "checkpoints"
-MODEL_URL = "https://weights.replicate.delivery/default/allenai/olmOCR-7B-0225-preview/model.tar"
-VISION_URL = "https://weights.replicate.delivery/default/qwen/Qwen2-VL-7B-Instruct/model.tar"
-
-
-def download_weights(url, dest):
-    start = time.time()
-    print("downloading url:", url)
-    print("downloading to:", dest)
-    subprocess.check_call(["pget", "-xf", url, dest], close_fds=False)
-    print("downloading took:", time.time() - start)
+MODEL_ID = "allenai/olmOCR-7B-0225-preview"
+VLLM_PORT = 8000
+VLLM_URL = f"http://localhost:{VLLM_PORT}"
 
 
 def get_page_count(pdf_path: str) -> int:
@@ -43,33 +36,43 @@ def get_page_count(pdf_path: str) -> int:
 
 class Predictor(BasePredictor):
     def setup(self) -> None:
-        """Load the model into memory."""
-        import torch
-        from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
-
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        os.makedirs(MODEL_CACHE, exist_ok=True)
-
-        if not os.path.exists(os.path.join(MODEL_CACHE, "olmOCR-7B-0225-preview")):
-            download_weights(MODEL_URL, os.path.join(MODEL_CACHE, "olmOCR-7B-0225-preview"))
-
-        self.model = Qwen2VLForConditionalGeneration.from_pretrained(
-            os.path.join(MODEL_CACHE, "olmOCR-7B-0225-preview"),
-            torch_dtype=torch.bfloat16,
-        ).eval().to(self.device)
-
-        if not os.path.exists(os.path.join(MODEL_CACHE, "Qwen2-VL-7B-Instruct")):
-            download_weights(VISION_URL, os.path.join(MODEL_CACHE, "Qwen2-VL-7B-Instruct"))
-
-        self.processor = AutoProcessor.from_pretrained(
-            os.path.join(MODEL_CACHE, "Qwen2-VL-7B-Instruct")
+        """Start vLLM server as a subprocess."""
+        print("Starting vLLM server...")
+        self.server_process = subprocess.Popen(
+            [
+                "python", "-m", "vllm.entrypoints.openai.api_server",
+                "--model", MODEL_ID,
+                "--port", str(VLLM_PORT),
+                "--gpu-memory-utilization", "0.9",
+                "--max-model-len", "8192",
+                "--dtype", "bfloat16",
+                "--trust-remote-code",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
         )
+        self._wait_for_server()
+        print("vLLM server ready.")
+
+    def _wait_for_server(self, timeout=600):
+        """Poll until vLLM server is healthy."""
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                req = urllib.request.urlopen(f"{VLLM_URL}/health", timeout=5)
+                if req.status == 200:
+                    return
+            except (urllib.error.URLError, ConnectionError, OSError):
+                pass
+            # Check if process died
+            if self.server_process.poll() is not None:
+                stdout = self.server_process.stdout.read().decode() if self.server_process.stdout else ""
+                raise RuntimeError(f"vLLM server exited with code {self.server_process.returncode}:\n{stdout[-2000:]}")
+            time.sleep(3)
+        raise RuntimeError("vLLM server failed to start within timeout")
 
     def _process_page(self, pdf_path: str, page_num: int) -> str:
-        """Process a single page and return extracted text."""
-        import torch
-        from PIL import Image
+        """Render a page and send it to the vLLM server."""
         from olmocr.data.renderpdf import render_pdf_to_base64png
         from olmocr.prompts import build_finetuning_prompt
         from olmocr.prompts.anchor import get_anchor_text
@@ -77,7 +80,6 @@ class Predictor(BasePredictor):
         image_base64 = render_pdf_to_base64png(
             pdf_path, page_num, target_longest_image_dim=1024
         )
-
         anchor_text = get_anchor_text(
             pdf_path, page_num,
             pdf_engine="pdfreport",
@@ -85,48 +87,36 @@ class Predictor(BasePredictor):
         )
         prompt = build_finetuning_prompt(anchor_text)
 
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/png;base64,{image_base64}",
+        request_data = json.dumps({
+            "model": MODEL_ID,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{image_base64}",
+                            },
                         },
-                    },
-                ],
-            }
-        ]
+                    ],
+                }
+            ],
+            "max_tokens": 4096,
+            "temperature": 0.8,
+        }).encode("utf-8")
 
-        text = self.processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+        req = urllib.request.Request(
+            f"{VLLM_URL}/v1/chat/completions",
+            data=request_data,
+            headers={"Content-Type": "application/json"},
         )
-        pil_image = Image.open(BytesIO(base64.b64decode(image_base64)))
-        inputs = self.processor(
-            text=[text], images=[pil_image],
-            padding=True, return_tensors="pt",
-        )
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        resp = urllib.request.urlopen(req, timeout=300)
+        result = json.loads(resp.read())
+        raw = result["choices"][0]["message"]["content"]
 
-        with torch.no_grad():
-            output = self.model.generate(
-                **inputs,
-                temperature=0.8,
-                max_new_tokens=4096,
-                num_return_sequences=1,
-                do_sample=True,
-            )
-
-        prompt_length = inputs["input_ids"].shape[1]
-        new_tokens = output[:, prompt_length:]
-        decoded = self.processor.tokenizer.batch_decode(
-            new_tokens, skip_special_tokens=True
-        )
-        raw = decoded[0] if decoded else ""
-
-        # olmOCR returns JSON with natural_text field — extract just the text
+        # Extract natural_text from olmOCR JSON response
         try:
             parsed = json.loads(raw)
             if isinstance(parsed, dict) and "natural_text" in parsed:
@@ -151,18 +141,29 @@ class Predictor(BasePredictor):
         if max_pages > 0:
             total_pages = min(total_pages, max_pages)
 
-        print(f"Processing {total_pages} pages from {pdf_path}")
+        print(f"Processing {total_pages} pages...")
 
-        md_parts = []
-        for page_num in range(1, total_pages + 1):
-            try:
-                print(f"  Page {page_num}/{total_pages}...")
-                text = self._process_page(pdf_path, page_num)
-                md_parts.append(text.strip())
-            except Exception as e:
-                print(f"  Warning: Page {page_num} failed: {e}")
-                md_parts.append(f"[Page {page_num}: failed to process]")
+        # Send all pages concurrently — vLLM batches them on the GPU
+        results = [None] * total_pages
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            futures = {}
+            for page_num in range(1, total_pages + 1):
+                future = executor.submit(self._process_page, pdf_path, page_num)
+                futures[future] = page_num - 1
 
+            done = 0
+            for future in concurrent.futures.as_completed(futures):
+                idx = futures[future]
+                done += 1
+                try:
+                    results[idx] = future.result()
+                    print(f"  [{done}/{total_pages}] Page {idx + 1} done")
+                except Exception as e:
+                    print(f"  [{done}/{total_pages}] Page {idx + 1} failed: {e}")
+                    results[idx] = f"[Page {idx + 1}: failed to process]"
+
+        # Assemble markdown
+        md_parts = [r.strip() if r else f"[Page {i+1}: no output]" for i, r in enumerate(results)]
         markdown = "\n\n".join(md_parts)
 
         output_path = PathLib(tempfile.mkdtemp()) / "output.md"

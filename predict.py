@@ -6,6 +6,7 @@ markdown file. Uses transformers for inference, processing pages sequentially.
 """
 
 import base64
+import json
 import os
 import subprocess
 import tempfile
@@ -123,7 +124,16 @@ class Predictor(BasePredictor):
         decoded = self.processor.tokenizer.batch_decode(
             new_tokens, skip_special_tokens=True
         )
-        return decoded[0] if decoded else ""
+        raw = decoded[0] if decoded else ""
+
+        # olmOCR returns JSON with natural_text field — extract just the text
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict) and "natural_text" in parsed:
+                return parsed["natural_text"]
+        except (json.JSONDecodeError, TypeError):
+            pass
+        return raw
 
     def predict(
         self,

@@ -14,6 +14,6 @@ jobs:
       - uses: replicate/setup-cog@v2
         with:
           token: ${{ secrets.REPLICATE_CLI_TOKEN }}
-          cog-version: "v0.17.0-rc.2"
+          cog-version: "v0.16.12"
 
       - run: cog push r8.im/jburnford/olmocr-pdf

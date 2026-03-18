@@ -4,13 +4,11 @@ build:
   python_version: "3.11"
   system_packages:
     - "poppler-utils"
-  python_packages:
-    - "olmocr==0.1.58"
-    - "pillow>=10.3.0"
 
   run:
     - curl -o /usr/local/bin/pget -L "https://github.com/replicate/pget/releases/download/v0.8.2/pget_linux_x86_64" && chmod +x /usr/local/bin/pget
-    - --mount=type=cache,target=/root/.cache/pip TORCH_CUDA_ARCH_LIST="8.0;8.6;9.0" CUDA_HOME=/usr/local/cuda pip install --ignore-installed vllm==0.6.6.post1
-    - pip install "numpy<2"
+    - --mount=type=cache,target=/root/.cache/pip TORCH_CUDA_ARCH_LIST="8.0;8.6;9.0" CUDA_HOME=/usr/local/cuda pip install vllm==0.6.6.post1
+    - pip install --no-deps olmocr==0.1.58
+    - pip install pypdfium2 pypdf ftfy lingua-language-detector "numpy<2"
 
 predict: "predict.py:Predictor"

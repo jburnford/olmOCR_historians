@@ -63,6 +63,10 @@ class Predictor(BasePredictor):
         if not os.path.exists(MODEL_PATH):
             download_weights(MODEL_URL, MODEL_PATH)
 
+        # Patch rope_scaling conflict: model config has both legacy 'type'
+        # and modern 'rope_type' fields which vLLM 0.6.x rejects
+        self._patch_rope_scaling()
+
         print("Starting vLLM server...")
         self.server_process = subprocess.Popen(
             [
@@ -80,6 +84,26 @@ class Predictor(BasePredictor):
         )
         self._wait_for_server()
         print("vLLM server ready.")
+
+    def _patch_rope_scaling(self):
+        """Fix rope_scaling config conflict for vLLM compatibility."""
+        config_path = os.path.join(MODEL_PATH, "config.json")
+        if not os.path.exists(config_path):
+            return
+        with open(config_path) as f:
+            config = json.load(f)
+
+        changed = False
+        for section in [config, config.get("text_config", {})]:
+            rs = section.get("rope_scaling")
+            if rs and "rope_type" in rs and "type" in rs:
+                del rs["type"]
+                changed = True
+
+        if changed:
+            with open(config_path, "w") as f:
+                json.dump(config, f, indent=2)
+            print("Patched rope_scaling config for vLLM compatibility")
 
     def _wait_for_server(self, timeout=600):
         """Poll until vLLM server is healthy."""
